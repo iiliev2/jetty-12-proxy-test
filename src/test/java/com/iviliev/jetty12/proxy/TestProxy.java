@@ -1,23 +1,33 @@
 package com.iviliev.jetty12.proxy;
 
 import java.io.IOException;
+import java.time.Instant;
 import java.util.Map;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.IntStream;
 
 import javax.servlet.AsyncContext;
+import javax.servlet.AsyncEvent;
+import javax.servlet.AsyncListener;
+import javax.servlet.ReadListener;
 import javax.servlet.ServletOutputStream;
 import javax.servlet.WriteListener;
 import javax.servlet.http.HttpServlet;
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
 
+import org.eclipse.jetty.client.ContentResponse;
 import org.eclipse.jetty.client.HttpClient;
 import org.eclipse.jetty.client.HttpProxy;
+import org.eclipse.jetty.client.Request;
 import org.eclipse.jetty.client.Response;
 import org.eclipse.jetty.ee8.proxy.AsyncMiddleManServlet;
 import org.eclipse.jetty.ee8.servlet.ServletContextHandler;
@@ -28,11 +38,17 @@ import org.eclipse.jetty.server.HttpConfiguration;
 import org.eclipse.jetty.server.HttpConnectionFactory;
 import org.eclipse.jetty.server.Server;
 import org.eclipse.jetty.server.ServerConnector;
+import org.eclipse.jetty.util.Callback;
 import org.eclipse.jetty.util.thread.QueuedThreadPool;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
 
 /**
  * Tests that a client will receive each separate chunk during a chunked transfer encoding, while the server is
@@ -40,6 +56,11 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
  * AsyncMiddleManServletTest.
  */
 public class TestProxy {
+    private static final Logger testLog = LoggerFactory.getLogger(TestProxy.class);
+    private static final Logger proxyLog =
+            LoggerFactory.getLogger(TestProxy.class.getPackageName() + ".AsyncMiddleManServlet");
+    private static final Logger serverLog = LoggerFactory.getLogger(TestProxy.class.getPackageName() + ".Server");
+
     private static int COUNT_MAX = 5;
     private static int COUNT_INTERVAL_SEC = 2;
 
@@ -54,8 +75,11 @@ public class TestProxy {
 
     @AfterEach
     public void dispose() throws Exception {
+        testLog.debug("Stopping client");
         client.stop();
+        testLog.debug("Stopping proxy");
         proxy.stop();
+        testLog.debug("Stopping server");
         server.stop();
     }
 
@@ -69,43 +93,55 @@ public class TestProxy {
         testChunkedTransfer(new AsyncBackendServlet());
     }
 
+    @Test
+    public void testChunkedTransferAbort() throws Exception {
+        // backend
+        startServer(new SyncBackendServlet(50));
+        AtomicReference<Instant> lastChunkTs = new AtomicReference<>();
+        //        startProxy(new AsyncMiddleManServlet());
+        startProxy(new MyAMMS(lastChunkTs));
+        startClient();
+
+        Request req = initClientRequest();
+
+        ScheduledFuture<?> abort = scheduler.schedule(() -> {
+            testLog.debug("Aborting");
+            if (!req.abort(new CancelRequest()).join()) {
+                throw new IllegalStateException("Could not abort");
+            }
+            testLog.debug("Aborted successfully");
+        }, 3, TimeUnit.SECONDS);
+
+        try {
+            req.send();
+        } catch (ExecutionException e) {
+            assertInstanceOf(CancelRequest.class, e.getCause());
+            assertTrue(abort.isDone());
+            abort.get();
+            TimeUnit.SECONDS.sleep(10);//give time for the proxy to stop the proxy client
+            Instant lastChunkTsSnapshot = lastChunkTs.get();
+            TimeUnit.SECONDS.sleep(COUNT_INTERVAL_SEC * 2L);
+            assertEquals(lastChunkTsSnapshot, lastChunkTs.get());
+            return;
+        }
+        fail("The request should have failed");
+    }
+
     public void testChunkedTransfer(HttpServlet backend) throws Exception {
         // backend
         startServer(backend);
 
         //        startProxy(new AsyncMiddleManServlet());
-        startProxy(new AsyncMiddleManServlet() {
-            @Override
-            protected ProxyWriter newProxyWriteListener(HttpServletRequest clientRequest, Response proxyResponse) {
-                return new ProxyWriter(clientRequest, proxyResponse) {
-                    @Override
-                    public void onWritePossible() throws IOException {
-                        super.onWritePossible();
-                        ServletOutputStream output = clientRequest.getAsyncContext().getResponse().getOutputStream();
-                        // FIXME how else do we fix this
-                        //output.flush();
-                    }
-                };
-            }
-        });
+        startProxy(new MyAMMS());
         startClient();
 
         Semaphore monitor = new Semaphore(0);
         CompletableFuture<Response> result = new CompletableFuture<>();
         AtomicInteger received = new AtomicInteger();
-        client
-                .newRequest("localhost", serverConnector.getLocalPort())
-                //.idleTimeout(COUNT_INTERVAL_SEC + 1, TimeUnit.SECONDS)
-                // simulating a very long-lived response(for example following k8s pod logs)
-                .timeout(1, TimeUnit.HOURS)
-                .onResponseBegin(response -> System.out.printf("Response version: %s%n", response.getVersion()))
-                .onResponseHeader((response, field) -> {
-                    System.out.printf("HttpField: %s%n", field);
-                    return false;
-                })
+        initClientRequest()
                 .onResponseContent((request, content) -> {
                     int c = content.get();
-                    System.out.printf("Got %d%n", c);
+                    testLog.debug("Got {}", c);
                     received.accumulateAndGet(c, Integer::sum);
                     monitor.release();
                 })
@@ -117,9 +153,22 @@ public class TestProxy {
                     }
                 });
         monitor(received, monitor, result);
-        Response response = result.get(COUNT_MAX * COUNT_INTERVAL_SEC * 2, TimeUnit.SECONDS);
+        Response response = result.get(COUNT_MAX * COUNT_INTERVAL_SEC * 2L, TimeUnit.SECONDS);
         assertEquals(200, response.getStatus());
         assertEquals(COUNT_MAX * (1 + COUNT_MAX) / 2, received.get());
+    }
+
+    private Request initClientRequest() {
+        return client
+                .newRequest("localhost", serverConnector.getLocalPort())
+                .idleTimeout(COUNT_INTERVAL_SEC + 1, TimeUnit.SECONDS)
+                // simulating a very long-lived response(for example following k8s pod logs)
+                .timeout(1, TimeUnit.HOURS)
+                .onResponseBegin(response -> testLog.debug("Response version: {}", response.getVersion()))
+                .onResponseHeader((response, field) -> {
+                    testLog.debug("HttpField: {}", field);
+                    return true;
+                });
     }
 
     private static void monitor(AtomicInteger id, Semaphore monitor, CompletableFuture<Response> result) {
@@ -164,6 +213,7 @@ public class TestProxy {
         configuration.setSendServerVersion(false);
         //        configuration.setOutputBufferSize(Integer.parseInt(value));
         proxyConnector = new ServerConnector(proxy, new HttpConnectionFactory(configuration));
+        proxyConnector.setIdleTimeout(TimeUnit.SECONDS.toMillis(COUNT_INTERVAL_SEC + 1));
         proxy.addConnector(proxyConnector);
 
         ServletContextHandler proxyContext = new ServletContextHandler();
@@ -171,7 +221,10 @@ public class TestProxy {
         proxy.setHandler(proxyContext);
         this.proxyServlet = proxyServlet;
         ServletHolder proxyServletHolder = new ServletHolder(proxyServlet);
-        proxyServletHolder.setInitParameters(Map.of());
+        proxyServletHolder.setInitParameters(Map.of(
+                "idleTimeout", Long.toString(TimeUnit.SECONDS.toMillis(COUNT_INTERVAL_SEC + 1)),
+                "timeout", Long.toString(TimeUnit.HOURS.toMillis(1))
+        ));
         proxyServletHolder.setAsyncSupported(true);
         proxyContext.addServlet(proxyServletHolder, "/*");
 
@@ -210,19 +263,19 @@ public class TestProxy {
 
             @Override
             public void onError(Throwable t) {
-                System.err.println(t.getMessage());
+                serverLog.error("Error during write", t);
                 ac.complete();
             }
 
             private void emit() {
                 scheduler.schedule(() -> {
                     try {
-                        System.out.printf("Emit%n");
+                        serverLog.debug("Emit");
                         dataGate.release();
                         writeOut();
                         emit();
                     } catch (Exception e) {
-                        System.err.println(e.getMessage());
+                        serverLog.error("Could not emit", e);
                         try {
                             throw new RuntimeException(e);
                         } finally {
@@ -256,14 +309,24 @@ public class TestProxy {
     }
 
     private static final class SyncBackendServlet extends HttpServlet {
+        private final int numChunksToSend;
+
+        public SyncBackendServlet(int numChunksToSend) {
+            this.numChunksToSend = numChunksToSend;
+        }
+
+        public SyncBackendServlet() {
+            this(COUNT_MAX);
+        }
+
         @Override
         protected void service(HttpServletRequest request, HttpServletResponse response) {
             response.addHeader(HttpHeader.TRANSFER_ENCODING.asString(), HttpHeaderValue.CHUNKED.asString());
-            IntStream.range(1, COUNT_MAX + 1).forEach(i -> {
+            IntStream.range(1, numChunksToSend + 1).forEach(i -> {
                 try {
                     response.getOutputStream().write(i);
                     response.getOutputStream().flush();
-                    System.out.printf("Emit%n");
+                    serverLog.debug("Emit {}", i);
                     TimeUnit.SECONDS.sleep(COUNT_INTERVAL_SEC);
                 } catch (Exception e) {
                     throw new RuntimeException(e);
@@ -272,4 +335,133 @@ public class TestProxy {
         }
     }
 
+    private static class MyAMMS extends AsyncMiddleManServlet {
+        private final AtomicReference<Instant> lastChunkTs;
+
+        private MyAMMS() {this(null);}
+
+        private MyAMMS(AtomicReference<Instant> lastChunkTs) {this.lastChunkTs = lastChunkTs;}
+
+        @Override
+        protected Logger createLogger() {
+            return proxyLog;
+        }
+
+        @Override
+        protected void sendProxyRequest(HttpServletRequest clientRequest, HttpServletResponse proxyResponse,
+                                        Request proxyRequest) {
+
+            AsyncContext ctx = clientRequest.getAsyncContext();
+            AsyncCallback callback = new AsyncCallback(proxyRequest);
+            try {
+                clientRequest.getInputStream().setReadListener(callback);
+                //                    proxyResponse.getOutputStream().setWriteListener(callback);
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+            ctx.addListener(callback);
+            super.sendProxyRequest(clientRequest, proxyResponse, proxyRequest);
+        }
+
+        @Override
+        protected AsyncMiddleManServlet.ProxyWriter newProxyWriteListener(HttpServletRequest clientRequest,
+                                                                          Response proxyResponse) {
+            return new AsyncMiddleManServlet.ProxyWriter(clientRequest, proxyResponse) {
+                @Override
+                public void onWritePossible() throws IOException {
+                    super.onWritePossible();
+                    if (lastChunkTs != null) {
+                        lastChunkTs.set(Instant.now());
+                    }
+                    ServletOutputStream output = clientRequest.getAsyncContext().getResponse().getOutputStream();
+                    // FIXME how else do we fix this
+//                    if (output.isReady()) {
+//                        output.flush();
+//                    }
+                }
+
+                // this is a proxy response write error callback
+                @Override
+                public void onError(Throwable failure) {
+                    proxyLog.error("Proxy response output stream error", failure);
+                    super.onError(failure);
+                }
+            };
+        }
+    }
+
+    private static class AsyncCallback implements AsyncListener, ReadListener, WriteListener {
+        private final Request proxyRequest;
+        private final AtomicReference<CancellationException> abort = new AtomicReference<>();
+
+        private AsyncCallback(Request proxyRequest) {this.proxyRequest = proxyRequest;}
+
+        private void end(Throwable event) {
+            proxyLog.debug("End callback: {}", event == null ? "cancelled" : event);
+            if (true) {
+                return;
+            }
+            CancellationException e = new CancellationException();
+            if (event != null) {
+                e.addSuppressed(event);
+            }
+            if (abort.compareAndSet(null, e)) {
+                proxyLog.debug("Aborting", abort.get());
+                proxyRequest
+                        .abort(abort.get())
+                        .whenComplete((r, t) -> {
+                            if (t != null) {
+                                proxyLog.error("Could not abort", t);
+                            } else if (!r) {
+                                proxyLog.debug("Could not abort the proxy request={}", proxyRequest.toString());
+                            } else {
+                                proxyLog.debug("Aborted request={}", proxyRequest.toString());
+                            }
+                        });
+            }
+        }
+
+        @Override
+        public void onComplete(AsyncEvent event) throws IOException {
+            end(event.getThrowable());
+        }
+
+        @Override
+        public void onTimeout(AsyncEvent event) throws IOException {
+
+        }
+
+        @Override
+        public void onError(AsyncEvent event) throws IOException {
+            end(event.getThrowable());
+        }
+
+        @Override
+        public void onStartAsync(AsyncEvent event) throws IOException {
+
+        }
+
+        @Override
+        public void onDataAvailable() throws IOException {
+
+        }
+
+        @Override
+        public void onAllDataRead() throws IOException {
+
+        }
+
+        @Override
+        public void onWritePossible() throws IOException {
+
+        }
+
+        @Override
+        public void onError(Throwable t) {
+            end(t);
+        }
+    }
+
+    private static class CancelRequest extends RuntimeException {
+    }
 }
