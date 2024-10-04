@@ -24,6 +24,9 @@ import org.eclipse.jetty.server.ServerConnector;
 import org.eclipse.jetty.server.SslConnectionFactory;
 import org.eclipse.jetty.util.ssl.SslContextFactory;
 
+/**
+ * Tests using http2. Does not use a CONNECT tunnel.
+ */
 public class TestHttp2Proxy extends TestProxy {
     private static final Pattern URL =
             Pattern.compile("(?<prefix>https?://localhost:)(?<port>[0-9]+)(?<suffix>/.+|/?)");
