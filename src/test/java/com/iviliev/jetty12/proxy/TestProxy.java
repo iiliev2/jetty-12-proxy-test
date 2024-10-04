@@ -26,7 +26,6 @@ import javax.servlet.http.HttpServletResponse;
 
 import org.eclipse.jetty.client.ContentResponse;
 import org.eclipse.jetty.client.HttpClient;
-import org.eclipse.jetty.client.HttpProxy;
 import org.eclipse.jetty.client.Request;
 import org.eclipse.jetty.client.Response;
 import org.eclipse.jetty.ee8.proxy.AsyncMiddleManServlet;
@@ -34,11 +33,8 @@ import org.eclipse.jetty.ee8.servlet.ServletContextHandler;
 import org.eclipse.jetty.ee8.servlet.ServletHolder;
 import org.eclipse.jetty.http.HttpHeader;
 import org.eclipse.jetty.http.HttpHeaderValue;
-import org.eclipse.jetty.server.HttpConfiguration;
-import org.eclipse.jetty.server.HttpConnectionFactory;
 import org.eclipse.jetty.server.Server;
 import org.eclipse.jetty.server.ServerConnector;
-import org.eclipse.jetty.util.Callback;
 import org.eclipse.jetty.util.thread.QueuedThreadPool;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -55,23 +51,22 @@ import static org.junit.jupiter.api.Assertions.fail;
  * streaming them, before the response is completed. Some of this test code has been borrowed from jetty's
  * AsyncMiddleManServletTest.
  */
-public class TestProxy {
+public abstract class TestProxy {
     private static final Logger testLog = LoggerFactory.getLogger(TestProxy.class);
     private static final Logger proxyLog =
             LoggerFactory.getLogger(TestProxy.class.getPackageName() + ".AsyncMiddleManServlet");
     private static final Logger serverLog = LoggerFactory.getLogger(TestProxy.class.getPackageName() + ".Server");
 
-    private static int COUNT_MAX = 5;
-    private static int COUNT_INTERVAL_SEC = 2;
+    protected static final int COUNT_MAX = 5;
+    protected static final int COUNT_INTERVAL_SEC = 2;
 
     private static final ScheduledThreadPoolExecutor scheduler = new ScheduledThreadPoolExecutor(5);
 
-    private HttpClient client;
-    private Server proxy;
-    private ServerConnector proxyConnector;
-    private AsyncMiddleManServlet proxyServlet;
-    private Server server;
-    private ServerConnector serverConnector;
+    protected HttpClient client;
+    protected Server proxy;
+    protected ServerConnector proxyConnector;
+    protected Server server;
+    protected ServerConnector serverConnector;
 
     @AfterEach
     public void dispose() throws Exception {
@@ -113,7 +108,8 @@ public class TestProxy {
         }, 3, TimeUnit.SECONDS);
 
         try {
-            req.send();
+            ContentResponse response = req.send();
+            testLog.error(response.getContentAsString());
         } catch (ExecutionException e) {
             assertInstanceOf(CancelRequest.class, e.getCause());
             assertTrue(abort.isDone());
@@ -124,6 +120,7 @@ public class TestProxy {
             assertEquals(lastChunkTsSnapshot, lastChunkTs.get());
             return;
         }
+
         fail("The request should have failed");
     }
 
@@ -158,9 +155,11 @@ public class TestProxy {
         assertEquals(COUNT_MAX * (1 + COUNT_MAX) / 2, received.get());
     }
 
+    protected abstract String getClientRequestUrl();
+
     private Request initClientRequest() {
         return client
-                .newRequest("localhost", serverConnector.getLocalPort())
+                .newRequest(getClientRequestUrl())
                 .idleTimeout(COUNT_INTERVAL_SEC + 1, TimeUnit.SECONDS)
                 // simulating a very long-lived response(for example following k8s pod logs)
                 .timeout(1, TimeUnit.HOURS)
@@ -190,8 +189,7 @@ public class TestProxy {
         QueuedThreadPool serverPool = new QueuedThreadPool();
         serverPool.setName("server");
         server = new Server(serverPool);
-        serverConnector = new ServerConnector(server);
-        server.addConnector(serverConnector);
+        serverConnector = initServerConnector(server);
 
         ServletContextHandler appCtx = new ServletContextHandler();
         appCtx.setContextPath("/");
@@ -201,25 +199,19 @@ public class TestProxy {
         appServletHolder.setAsyncSupported(true);
 
         server.start();
+        testLog.debug("Server port: {}", serverConnector.getLocalPort());
     }
 
     private void startProxy(AsyncMiddleManServlet proxyServlet) throws Exception {
         QueuedThreadPool proxyPool = new QueuedThreadPool();
         proxyPool.setName("proxy");
         proxy = new Server(proxyPool);
-
-        HttpConfiguration configuration = new HttpConfiguration();
-        configuration.setSendDateHeader(false);
-        configuration.setSendServerVersion(false);
-        //        configuration.setOutputBufferSize(Integer.parseInt(value));
-        proxyConnector = new ServerConnector(proxy, new HttpConnectionFactory(configuration));
-        proxyConnector.setIdleTimeout(TimeUnit.SECONDS.toMillis(COUNT_INTERVAL_SEC + 1));
+        proxyConnector = initProxyConnector(proxy);
         proxy.addConnector(proxyConnector);
 
         ServletContextHandler proxyContext = new ServletContextHandler();
         proxyContext.setContextPath("/");
         proxy.setHandler(proxyContext);
-        this.proxyServlet = proxyServlet;
         ServletHolder proxyServletHolder = new ServletHolder(proxyServlet);
         proxyServletHolder.setInitParameters(Map.of(
                 "idleTimeout", Long.toString(TimeUnit.SECONDS.toMillis(COUNT_INTERVAL_SEC + 1)),
@@ -229,17 +221,27 @@ public class TestProxy {
         proxyContext.addServlet(proxyServletHolder, "/*");
 
         proxy.start();
+
+        testLog.debug("Proxy port: {}", proxyConnector.getLocalPort());
     }
 
     private void startClient() throws Exception {
         QueuedThreadPool clientPool = new QueuedThreadPool();
         clientPool.setName("client");
-        client = new HttpClient();
+        client = initClient();
         client.setExecutor(clientPool);
-        // disabling the proxy also fixes the tests
-        client.getProxyConfiguration().addProxy(new HttpProxy("localhost", proxyConnector.getLocalPort()));
         client.start();
     }
+
+    protected abstract ServerConnector initServerConnector(Server server);
+
+    protected abstract ServerConnector initProxyConnector(Server proxy);
+
+    protected abstract HttpClient initClient();
+
+    protected abstract HttpClient initProxyClient();
+
+    protected abstract String rewriteTarget(HttpServletRequest original);
 
     private static final class AsyncBackendServlet extends HttpServlet {
         private static class Responder implements WriteListener {
@@ -335,7 +337,7 @@ public class TestProxy {
         }
     }
 
-    private static class MyAMMS extends AsyncMiddleManServlet {
+    private class MyAMMS extends AsyncMiddleManServlet {
         private final AtomicReference<Instant> lastChunkTs;
 
         private MyAMMS() {this(null);}
@@ -348,19 +350,34 @@ public class TestProxy {
         }
 
         @Override
+        protected String rewriteTarget(HttpServletRequest clientRequest) {
+            String target = TestProxy.this.rewriteTarget(clientRequest);
+            if (target == null) {
+                return super.rewriteTarget(clientRequest);
+            }
+            return target;
+        }
+
+        @Override
         protected void sendProxyRequest(HttpServletRequest clientRequest, HttpServletResponse proxyResponse,
                                         Request proxyRequest) {
 
             AsyncContext ctx = clientRequest.getAsyncContext();
             AsyncCallback callback = new AsyncCallback(proxyRequest);
             try {
-                clientRequest.getInputStream().setReadListener(callback);
-                //                    proxyResponse.getOutputStream().setWriteListener(callback);
+                // need to override ProxyReader and ProxyWriter instead
+                //clientRequest.getInputStream().setReadListener(callback);
+                //proxyResponse.getOutputStream().setWriteListener(callback);
             } catch (Exception e) {
                 throw new RuntimeException(e);
             }
             ctx.addListener(callback);
             super.sendProxyRequest(clientRequest, proxyResponse, proxyRequest);
+        }
+
+        @Override
+        protected HttpClient newHttpClient() {
+            return TestProxy.this.initProxyClient();
         }
 
         @Override
@@ -383,7 +400,7 @@ public class TestProxy {
                 // this is a proxy response write error callback
                 @Override
                 public void onError(Throwable failure) {
-                    proxyLog.error("Proxy response output stream error", failure);
+                    proxyLog.trace("Proxy response output stream error", failure);
                     super.onError(failure);
                 }
             };
